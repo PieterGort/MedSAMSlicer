@@ -70,16 +70,13 @@ def infer_3d(predictor, img_npz_file, gts_file, propagate, model_cfg, pred_save_
         image_size = yaml_data['model']['image_size']
     img_resized = resize_rgb(img_3D, image_size)
     img_resized = img_resized / 255.0
-    img_resized = torch.from_numpy(img_resized).cuda()
-    img_mean=(0.485, 0.456, 0.406)
-    img_std=(0.229, 0.224, 0.225)
-    img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None].cuda()
-    img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None].cuda()
+    img_resized = torch.from_numpy(img_resized).float()  # keep on CPU
+    img_mean = torch.tensor((0.485, 0.456, 0.406), dtype=torch.float32)[:, None, None]
+    img_std = torch.tensor((0.229, 0.224, 0.225), dtype=torch.float32)[:, None, None]
     img_resized -= img_mean
     img_resized /= img_std
-    z_mids = []
-    
-    z_indices, slice_idx = z_range[:2], z_range[2]
+    z_indices = np.asarray(z_range[:2], dtype=np.int32)
+    slice_idx = int(z_range[2])
 
     if not propagate:
         # predicting only middle slice
@@ -97,37 +94,48 @@ def infer_3d(predictor, img_npz_file, gts_file, propagate, model_cfg, pred_save_
 
         return
 
+    if gts is None:
+        raise ValueError('Propagation requires a middle-slice segmentation mask.')
 
-    for idx, points in enumerate(boxes_3D, start=1):
-        gt = (gts == (idx))
-        indices = np.where(gt)
-        z_mid_orig = indices[0][0]
+    object_labels = [int(label) for label in np.unique(gts) if label != 0]
+    if not object_labels:
+        raise ValueError('Propagation requires at least one labeled object in the middle-slice mask.')
 
-        z_min = z_indices.min() if z_indices.size > 0 else None
-        z_max = z_indices.max() if z_indices.size > 0 else None
+    z_min = int(z_indices.min()) if z_indices.size > 0 else 0
+    z_max = int(z_indices.max()) if z_indices.size > 0 else D - 1
+    z_min = max(0, z_min)
+    z_max = min(z_max, D - 1)
 
-        img = img_resized[z_min:(z_max+1)]
-        z_mid = int(img.shape[0]/2)
-        z_mids.append(z_mid_orig)
+    img = img_resized[z_min:(z_max + 1)].cuda()  # only move the needed z-range to GPU
+
+    for label in object_labels:
+        gt = (gts == label)
+        annotated_slices = np.flatnonzero(np.any(gt, axis=(1, 2)))
+        if annotated_slices.size == 0:
+            print(f'Skipping label {label}: empty annotation mask.')
+            continue
+
+        # Use the annotated slice closest to the requested middle slice.
+        z_mid_orig = int(annotated_slices[np.abs(annotated_slices - slice_idx).argmin()])
         mask_prompt = gt[z_mid_orig]
-        ann_frame_idx = z_mid_orig - (z_min if z_min is not None else 0)
+        ann_frame_idx = z_mid_orig - z_min
 
-        print('analyzed image size', img.shape, 'mid idx', z_mid)
+        print('analyzed image size', img.shape, 'mid idx', ann_frame_idx)
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
             # input img is shape depth_to_consider, 3, 512, 512
             inference_state = predictor.init_state(img, video_height, video_width)
             frame_idx, object_ids, masks = predictor.add_new_mask(inference_state, frame_idx=ann_frame_idx, obj_id=1, mask=mask_prompt)
-            segs_3D[z_mid_orig, ((masks[0] > 0.0).cpu().numpy())[0]] = idx
+            segs_3D[z_mid_orig, ((masks[0] > 0.0).cpu().numpy())[0]] = label
             # run propagation throughout the video and collect the results in a dict
             #video_segments = {}  # video_segments contains the per-frame segmentation results
             for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
                 print(out_frame_idx)
-                segs_3D[(z_min + out_frame_idx), (out_mask_logits[0] > 0.0).cpu().numpy()[0]] = idx
+                segs_3D[(z_min + out_frame_idx), (out_mask_logits[0] > 0.0).cpu().numpy()[0]] = label
             predictor.reset_state(inference_state)
             frame_idx, object_ids, masks = predictor.add_new_mask(inference_state, frame_idx=ann_frame_idx, obj_id=1, mask=mask_prompt)
             for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state, reverse=True):
                 print(out_frame_idx)
-                segs_3D[(z_min + out_frame_idx), (out_mask_logits[0] > 0.0).cpu().numpy()[0]] = idx
+                segs_3D[(z_min + out_frame_idx), (out_mask_logits[0] > 0.0).cpu().numpy()[0]] = label
             predictor.reset_state(inference_state)
 
     print(np.unique(segs_3D))

@@ -205,6 +205,7 @@ class MedSAM2Widget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         """Called just before the scene is closed."""
         # Parameter node will be reset, do not use it anymore
         self.setParameterNode(None)
+        self.logic.resetSegmentationState()
 
     def onSceneEndClose(self, caller, event) -> None:
         """Called just after the scene is closed."""
@@ -425,6 +426,23 @@ class MedSAM2Logic(ScriptedLoadableModuleLogic):
         paral_thread.join()
 
         self.progressbar.close()
+
+    def isNodeInScene(self, node):
+        if node is None:
+            return False
+
+        try:
+            node_id = node.GetID()
+        except RuntimeError:
+            return False
+
+        return bool(node_id) and slicer.mrmlScene.GetNodeByID(node_id) is not None
+
+    def resetSegmentationState(self):
+        self.middleMaskNode = None
+        self.allSegmentsNode = None
+        self.cachedBoundaries = None
+        self.lastSegmentLabel = None
     
 
     def segment_helper(self, img_path, gts_path, result_path, ip, port, job_event):
@@ -472,43 +490,62 @@ class MedSAM2Logic(ScriptedLoadableModuleLogic):
         job_event.set()
     
     def showSegmentation(self, segmentation_mask, set_middle_mask=False, improve_previous=False):
-        if self.allSegmentsNode is None:
-            self.allSegmentsNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
-
-        current_seg_group = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode") if set_middle_mask else self.allSegmentsNode
-        current_seg_group.SetReferenceImageGeometryParameterFromVolumeNode(self.volume_node)
-
         labels = np.unique(segmentation_mask)[1:] # all labels except background(0)
+        if len(labels) == 0:
+            slicer.util.errorDisplay("No segmentation was returned.")
+            return
+
+        if set_middle_mask:
+            if self.isNodeInScene(self.middleMaskNode):
+                slicer.mrmlScene.RemoveNode(self.middleMaskNode)
+            current_seg_group = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", "Middle Slice Segmentation")
+        else:
+            if not improve_previous and self.isNodeInScene(self.allSegmentsNode):
+                slicer.mrmlScene.RemoveNode(self.allSegmentsNode)
+                self.allSegmentsNode = None
+                self.lastSegmentLabel = None
+
+            if not self.isNodeInScene(self.allSegmentsNode):
+                self.allSegmentsNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", "Full Segmentation")
+            current_seg_group = self.allSegmentsNode
+
+        current_seg_group.CreateDefaultDisplayNodes()
+        current_seg_group.SetReferenceImageGeometryParameterFromVolumeNode(self.volume_node)
+        display_node = current_seg_group.GetDisplayNode()
+        if display_node is not None:
+            display_node.SetVisibility(True)
+            try:
+                display_node.SetVisibility2DFill(True)
+                display_node.SetVisibility2DOutline(True)
+            except AttributeError:
+                pass
 
         for idx, label in enumerate(labels, start=1):
-            curr_object = np.zeros_like(segmentation_mask)
-            curr_object[segmentation_mask == idx] = idx
+            curr_object = (segmentation_mask == label).astype(np.uint8)
             new_seg_label = 'segment_'+str(idx)+'_'+str(int(time.time()))
-            segment_volume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode", new_seg_label)
-            slicer.util.updateVolumeFromArray(segment_volume, curr_object)
-
-            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(segment_volume, current_seg_group)
-            slicer.util.updateSegmentBinaryLabelmapFromArray(curr_object, current_seg_group, segment_volume.GetName(), self.volume_node)
-            
-            slicer.mrmlScene.RemoveNode(segment_volume)
+            segment_id = current_seg_group.GetSegmentation().AddEmptySegment("", new_seg_label)
+            slicer.util.updateSegmentBinaryLabelmapFromArray(curr_object, current_seg_group, segment_id, self.volume_node)
 
         if set_middle_mask:
             self.middleMaskNode = current_seg_group
         else:
-            try:
+            if self.isNodeInScene(self.middleMaskNode):
                 slicer.mrmlScene.RemoveNode(self.middleMaskNode)
-            except:
-                pass
-        if improve_previous:
+            self.middleMaskNode = None
+        if improve_previous and self.lastSegmentLabel is not None:
             print('Removing segment:', self.lastSegmentLabel)
             self.allSegmentsNode.GetSegmentation().RemoveSegment(self.lastSegmentLabel)
         
-        self.lastSegmentLabel = new_seg_label
+        self.lastSegmentLabel = segment_id
         print('self.lastSegmentLabel is updated to', self.lastSegmentLabel)
 
 
     def segment(self):
         self.captureImage()
+        if not self.isNodeInScene(self.middleMaskNode):
+            slicer.util.errorDisplay("Please run 'Segment Middle Slice' before 'Full Segmentation'.")
+            return
+
         slice_idx, bboxes, zrange = self.get_bounding_box(make2d=False)
         with tempfile.TemporaryDirectory() as tmpdirname:
             img_path = "%s/img_data.npz"%(tmpdirname,)
